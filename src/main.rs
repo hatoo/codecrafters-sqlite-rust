@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use regex::RegexBuilder;
+use std::collections::HashSet;
 use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::{prelude::*, SeekFrom};
@@ -158,7 +159,7 @@ fn rows(page: &[u8]) -> Vec<Row> {
         .collect()
 }
 
-fn row_names(sql: &str) -> Vec<String> {
+fn sql_column_names(sql: &str) -> Vec<String> {
     let inner_bracket: String = sql
         .chars()
         .skip_while(|c| *c != '(')
@@ -237,14 +238,18 @@ fn main() -> Result<()> {
         let number_of_cells = u16::from_be_bytes([page[3], page[4]]);
 
         println!("{}", number_of_cells);
-    } else if let Some(captures) = RegexBuilder::new(r"SELECT (\w+) FROM (\w+)")
+    } else if let Some(captures) = RegexBuilder::new(r"SELECT (.+) FROM (\w+)")
         .case_insensitive(true)
         .build()
         .unwrap()
         .captures(command)
     {
         let table_name = captures.get(2).unwrap().as_str();
-        let column_name = captures.get(1).unwrap().as_str();
+        let column_names = captures.get(1).unwrap().as_str();
+        let column_names = column_names
+            .split(',')
+            .map(|s| s.trim())
+            .collect::<Vec<_>>();
 
         let mut first_page = vec![0; page_size as usize];
         file.seek(SeekFrom::Start(0))?;
@@ -255,9 +260,12 @@ fn main() -> Result<()> {
 
         let table = tables.into_iter().find(|t| t.name == table_name).unwrap();
 
-        let row_names = row_names(table.sql.as_str());
+        let sql_coumn_names = sql_column_names(table.sql.as_str());
 
-        let index = row_names.iter().position(|n| n == column_name).unwrap();
+        let indices: Vec<usize> = column_names
+            .into_iter()
+            .map(|c| sql_coumn_names.iter().position(|s| s == &c).unwrap())
+            .collect();
 
         let mut page = vec![0; page_size as usize];
         file.seek(SeekFrom::Start(
@@ -268,7 +276,14 @@ fn main() -> Result<()> {
         let rows = rows(&page);
 
         for row in rows {
-            println!("{}", row[index]);
+            println!(
+                "{}",
+                indices
+                    .iter()
+                    .map(|&i| row[i].to_string())
+                    .collect::<Vec<_>>()
+                    .join("|")
+            );
         }
     } else {
         bail!("Missing or invalid command passed: {}", command)
