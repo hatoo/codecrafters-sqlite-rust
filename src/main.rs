@@ -19,7 +19,7 @@ struct Table {
 enum Column {
     Integer(i64),
     Text(String),
-    NULL,
+    // NULL,
 }
 
 impl Display for Column {
@@ -27,7 +27,7 @@ impl Display for Column {
         match self {
             Column::Integer(i) => write!(f, "{}", i),
             Column::Text(s) => write!(f, "{}", s),
-            Column::NULL => write!(f, "NULL"),
+            // Column::NULL => write!(f, "NULL"),
         }
     }
 }
@@ -111,51 +111,88 @@ fn tables(first_page: &[u8]) -> Vec<Table> {
         .collect()
 }
 
-fn rows(page: &[u8]) -> Vec<Row> {
-    // Assume leaf page
-    let number_of_cells = u16::from_be_bytes([page[3], page[4]]);
+fn rows(page: &[u8], file: &mut File, page_size: usize) -> Vec<Row> {
+    match page[0] {
+        0x05 => {
+            // internal page
+            let number_of_cells = u16::from_be_bytes([page[3], page[4]]);
 
-    let cell_indices = (0..number_of_cells as usize)
-        .map(|i| u16::from_be_bytes([page[8 + 2 * i], page[8 + 2 * i + 1]]))
-        .collect::<Vec<_>>();
+            let cell_indices = (0..number_of_cells as usize)
+                .map(|i| u16::from_be_bytes([page[12 + 2 * i], page[12 + 2 * i + 1]]))
+                .collect::<Vec<_>>();
 
-    cell_indices
-        .into_iter()
-        .map(|i| {
-            let cell = &page[i as usize..];
+            cell_indices
+                .into_iter()
+                .flat_map(|i| {
+                    let cell = &page[i as usize..];
+                    let next_page = u32::from_be_bytes([cell[0], cell[1], cell[2], cell[3]]);
+                    let mut page = vec![0; page_size];
+                    file.seek(SeekFrom::Start((next_page as u64 - 1) * page_size as u64))
+                        .unwrap();
+                    file.read_exact(&mut page).unwrap();
 
-            let (_payload_length, cell) = variant(cell);
-            let (_row_id, cell) = variant(cell);
-            // assume header length is 1 byte
-            let header_length = cell[0];
-            let mut header = &cell[1..header_length as usize];
-            let mut cell = &cell[header_length as usize..];
+                    rows(&page, file, page_size).into_iter()
+                })
+                .collect()
+        }
+        0x0d => {
+            // leaf page
+            let number_of_cells = u16::from_be_bytes([page[3], page[4]]);
 
-            let mut row = vec![];
+            let cell_indices = (0..number_of_cells as usize)
+                .map(|i| u16::from_be_bytes([page[8 + 2 * i], page[8 + 2 * i + 1]]))
+                .collect::<Vec<_>>();
 
-            while !header.is_empty() {
-                let (t, header_) = variant(header);
-                header = header_;
+            cell_indices
+                .into_iter()
+                .map(|i| {
+                    let cell = &page[i as usize..];
 
-                match t {
-                    0 => row.push(Column::NULL),
-                    1 => {
-                        row.push(Column::Integer(cell[0] as i64));
-                        cell = &cell[1..];
+                    let (_payload_length, cell) = variant(cell);
+                    let (row_id, cell) = variant(cell);
+                    // assume header length is 1 byte
+                    let header_length = cell[0];
+                    let mut header = &cell[1..header_length as usize];
+                    let mut cell = &cell[header_length as usize..];
+
+                    let mut row = vec![];
+
+                    while !header.is_empty() {
+                        let (t, header_) = variant(header);
+                        header = header_;
+
+                        match t {
+                            // TODO
+                            0 => row.push(Column::Integer(row_id as i64)),
+                            1 => {
+                                row.push(Column::Integer(cell[0] as i64));
+                                cell = &cell[1..];
+                            }
+                            2 => {
+                                row.push(Column::Integer(
+                                    i16::from_be_bytes([cell[0], cell[1]]) as i64
+                                ));
+                                cell = &cell[2..];
+                            }
+                            9 => {
+                                row.push(Column::Integer(1));
+                            }
+                            t if t >= 13 && t % 2 == 1 => {
+                                let length = ((t - 13) / 2) as usize;
+                                let text = std::str::from_utf8(&cell[..length]).unwrap();
+                                row.push(Column::Text(text.to_string()));
+                                cell = &cell[length..];
+                            }
+                            _ => unimplemented!("type {}", t),
+                        }
                     }
-                    t if t >= 13 && t % 2 == 1 => {
-                        let length = ((t - 13) / 2) as usize;
-                        let text = std::str::from_utf8(&cell[..length]).unwrap();
-                        row.push(Column::Text(text.to_string()));
-                        cell = &cell[length..];
-                    }
-                    _ => unimplemented!("type {}", t),
-                }
-            }
 
-            row
-        })
-        .collect()
+                    row
+                })
+                .collect()
+        }
+        _ => unimplemented!(),
+    }
 }
 
 fn sql_column_names(sql: &str) -> Vec<String> {
@@ -293,11 +330,13 @@ fn main() -> Result<()> {
             Vec::new()
         };
 
-        let rows = rows(&page).into_iter().filter(|row| {
-            equals
-                .iter()
-                .all(|(column_index, value)| row[*column_index] == Column::Text(value.to_string()))
-        });
+        let rows = rows(&page, &mut file, page_size as usize)
+            .into_iter()
+            .filter(|row| {
+                equals.iter().all(|(column_index, value)| {
+                    row[*column_index] == Column::Text(value.to_string())
+                })
+            });
 
         for row in rows {
             println!(
