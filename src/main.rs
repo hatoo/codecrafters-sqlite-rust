@@ -1,6 +1,7 @@
 use anyhow::{bail, Result};
 use std::fs::File;
 use std::io::{prelude::*, SeekFrom};
+use std::vec;
 
 struct Table {
     ty: String,
@@ -132,6 +133,30 @@ fn main() -> Result<()> {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
+        }
+        command if command.to_uppercase().starts_with("SELECT COUNT(*) FROM") => {
+            let table_name = command.split_whitespace().nth(3).unwrap();
+
+            let mut first_page = vec![0; page_size as usize];
+            file.seek(SeekFrom::Start(0))?;
+            file.read_exact(&mut first_page)?;
+            let first_page = first_page;
+
+            let tables = tables(&first_page);
+
+            let root_page = tables
+                .into_iter()
+                .find(|t| t.name == table_name)
+                .unwrap()
+                .rootpage;
+
+            let mut page = vec![0; page_size as usize];
+            file.seek(SeekFrom::Start((root_page - 1) as u64 * page_size as u64))?;
+            file.read_exact(&mut page)?;
+            let page = page;
+            let number_of_cells = u16::from_be_bytes([page[3], page[4]]);
+
+            println!("{}", number_of_cells);
         }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
