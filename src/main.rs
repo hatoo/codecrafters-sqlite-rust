@@ -1,6 +1,5 @@
 use anyhow::{bail, Result};
 use regex::RegexBuilder;
-use std::collections::HashSet;
 use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::{prelude::*, SeekFrom};
@@ -16,7 +15,7 @@ struct Table {
     sql: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, PartialOrd)]
 enum Column {
     Integer(i64),
     Text(String),
@@ -238,7 +237,7 @@ fn main() -> Result<()> {
         let number_of_cells = u16::from_be_bytes([page[3], page[4]]);
 
         println!("{}", number_of_cells);
-    } else if let Some(captures) = RegexBuilder::new(r"SELECT (.+) FROM (\w+)")
+    } else if let Some(captures) = RegexBuilder::new(r"SELECT (.+) FROM (\w+)( WHERE (.+))?")
         .case_insensitive(true)
         .build()
         .unwrap()
@@ -250,6 +249,7 @@ fn main() -> Result<()> {
             .split(',')
             .map(|s| s.trim())
             .collect::<Vec<_>>();
+        let where_clause = captures.get(4).map(|m| m.as_str());
 
         let mut first_page = vec![0; page_size as usize];
         file.seek(SeekFrom::Start(0))?;
@@ -273,7 +273,31 @@ fn main() -> Result<()> {
         ))?;
         file.read_exact(&mut page)?;
 
-        let rows = rows(&page);
+        let equals = if let Some(where_clause) = where_clause {
+            let mut equals = Vec::new();
+            let mut iter = where_clause.split('=');
+            let column_name = iter.next().unwrap().trim();
+            let value = iter
+                .next()
+                .unwrap()
+                .trim()
+                .trim_start_matches('\'')
+                .trim_end_matches('\'');
+            let column_index = sql_coumn_names
+                .iter()
+                .position(|s| s == &column_name)
+                .unwrap();
+            equals.push((column_index, value));
+            equals
+        } else {
+            Vec::new()
+        };
+
+        let rows = rows(&page).into_iter().filter(|row| {
+            equals
+                .iter()
+                .all(|(column_index, value)| row[*column_index] == Column::Text(value.to_string()))
+        });
 
         for row in rows {
             println!(
