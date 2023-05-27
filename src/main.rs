@@ -1,8 +1,12 @@
 use anyhow::{bail, Result};
+use regex::RegexBuilder;
+use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::{prelude::*, SeekFrom};
 use std::vec;
 
+#[derive(Debug)]
+#[allow(dead_code)]
 struct Table {
     ty: String,
     name: String,
@@ -10,6 +14,25 @@ struct Table {
     rootpage: u32,
     sql: String,
 }
+
+#[derive(Debug)]
+enum Column {
+    Integer(i64),
+    Text(String),
+    NULL,
+}
+
+impl Display for Column {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Column::Integer(i) => write!(f, "{}", i),
+            Column::Text(s) => write!(f, "{}", s),
+            Column::NULL => write!(f, "NULL"),
+        }
+    }
+}
+
+type Row = Vec<Column>;
 
 fn variant(buf: &[u8]) -> (u64, &[u8]) {
     let mut i = 0;
@@ -41,7 +64,7 @@ fn tables(first_page: &[u8]) -> Vec<Table> {
             let (_row_id, cell) = variant(cell);
             // assume header length is 1 byte
             let header_length = cell[0];
-            let mut header = &cell[1..header_length as usize];
+            let header = &cell[1..header_length as usize];
             let mut cell = &cell[header_length as usize..];
 
             // type text
@@ -88,6 +111,66 @@ fn tables(first_page: &[u8]) -> Vec<Table> {
         .collect()
 }
 
+fn rows(page: &[u8]) -> Vec<Row> {
+    // Assume leaf page
+    let number_of_cells = u16::from_be_bytes([page[3], page[4]]);
+
+    let cell_indices = (0..number_of_cells as usize)
+        .map(|i| u16::from_be_bytes([page[8 + 2 * i], page[8 + 2 * i + 1]]))
+        .collect::<Vec<_>>();
+
+    cell_indices
+        .into_iter()
+        .map(|i| {
+            let cell = &page[i as usize..];
+
+            let (_payload_length, cell) = variant(cell);
+            let (_row_id, cell) = variant(cell);
+            // assume header length is 1 byte
+            let header_length = cell[0];
+            let mut header = &cell[1..header_length as usize];
+            let mut cell = &cell[header_length as usize..];
+
+            let mut row = vec![];
+
+            while !header.is_empty() {
+                let (t, header_) = variant(header);
+                header = header_;
+
+                match t {
+                    0 => row.push(Column::NULL),
+                    1 => {
+                        row.push(Column::Integer(cell[0] as i64));
+                        cell = &cell[1..];
+                    }
+                    t if t >= 13 && t % 2 == 1 => {
+                        let length = ((t - 13) / 2) as usize;
+                        let text = std::str::from_utf8(&cell[..length]).unwrap();
+                        row.push(Column::Text(text.to_string()));
+                        cell = &cell[length..];
+                    }
+                    _ => unimplemented!("type {}", t),
+                }
+            }
+
+            row
+        })
+        .collect()
+}
+
+fn row_names(sql: &str) -> Vec<String> {
+    let inner_bracket: String = sql
+        .chars()
+        .skip_while(|c| *c != '(')
+        .skip(1)
+        .take_while(|c| *c != ')')
+        .collect();
+    inner_bracket
+        .split(',')
+        .map(|s| s.trim().split_whitespace().next().unwrap().to_string())
+        .collect()
+}
+
 fn main() -> Result<()> {
     // Parse arguments
     let args = std::env::args().collect::<Vec<_>>();
@@ -112,53 +195,83 @@ fn main() -> Result<()> {
 
     // Parse command and act accordingly
     let command = &args[2];
-    match command.as_str() {
-        ".dbinfo" => {
-            println!("database page size: {}", page_size);
-            println!("number of tables: {}", number_of_cells);
-        }
-        ".tables" => {
-            let mut first_page = vec![0; page_size as usize];
-            file.seek(SeekFrom::Start(0))?;
-            file.read_exact(&mut first_page)?;
-            let first_page = first_page;
+    if command == ".dbinfo" {
+        println!("database page size: {}", page_size);
+        println!("number of tables: {}", number_of_cells);
+    } else if command == ".tables" {
+        let mut first_page = vec![0; page_size as usize];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut first_page)?;
+        let first_page = first_page;
 
-            let tables = tables(&first_page);
-            println!(
-                "{}",
-                tables
-                    .into_iter()
-                    .filter(|t| t.name != "sqlite_sequence")
-                    .map(|t| t.name)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-        }
-        command if command.to_uppercase().starts_with("SELECT COUNT(*) FROM") => {
-            let table_name = command.split_whitespace().nth(3).unwrap();
-
-            let mut first_page = vec![0; page_size as usize];
-            file.seek(SeekFrom::Start(0))?;
-            file.read_exact(&mut first_page)?;
-            let first_page = first_page;
-
-            let tables = tables(&first_page);
-
-            let root_page = tables
+        let tables = tables(&first_page);
+        println!(
+            "{}",
+            tables
                 .into_iter()
-                .find(|t| t.name == table_name)
-                .unwrap()
-                .rootpage;
+                .filter(|t| t.name != "sqlite_sequence")
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    } else if command.to_uppercase().starts_with("SELECT COUNT(*) FROM") {
+        let table_name = command.split_whitespace().nth(3).unwrap();
 
-            let mut page = vec![0; page_size as usize];
-            file.seek(SeekFrom::Start((root_page - 1) as u64 * page_size as u64))?;
-            file.read_exact(&mut page)?;
-            let page = page;
-            let number_of_cells = u16::from_be_bytes([page[3], page[4]]);
+        let mut first_page = vec![0; page_size as usize];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut first_page)?;
+        let first_page = first_page;
 
-            println!("{}", number_of_cells);
+        let tables = tables(&first_page);
+
+        let root_page = tables
+            .into_iter()
+            .find(|t| t.name == table_name)
+            .unwrap()
+            .rootpage;
+
+        let mut page = vec![0; page_size as usize];
+        file.seek(SeekFrom::Start((root_page - 1) as u64 * page_size as u64))?;
+        file.read_exact(&mut page)?;
+        let page = page;
+        let number_of_cells = u16::from_be_bytes([page[3], page[4]]);
+
+        println!("{}", number_of_cells);
+    } else if let Some(captures) = RegexBuilder::new(r"SELECT (\w+) FROM (\w+)")
+        .case_insensitive(true)
+        .build()
+        .unwrap()
+        .captures(command)
+    {
+        let table_name = captures.get(2).unwrap().as_str();
+        let column_name = captures.get(1).unwrap().as_str();
+
+        let mut first_page = vec![0; page_size as usize];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut first_page)?;
+        let first_page = first_page;
+
+        let tables = tables(&first_page);
+
+        let table = tables.into_iter().find(|t| t.name == table_name).unwrap();
+
+        let row_names = row_names(table.sql.as_str());
+
+        let index = row_names.iter().position(|n| n == column_name).unwrap();
+
+        let mut page = vec![0; page_size as usize];
+        file.seek(SeekFrom::Start(
+            (table.rootpage - 1) as u64 * page_size as u64,
+        ))?;
+        file.read_exact(&mut page)?;
+
+        let rows = rows(&page);
+
+        for row in rows {
+            println!("{}", row[index]);
         }
-        _ => bail!("Missing or invalid command passed: {}", command),
+    } else {
+        bail!("Missing or invalid command passed: {}", command)
     }
 
     Ok(())
