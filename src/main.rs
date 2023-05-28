@@ -195,6 +195,149 @@ fn rows(page: &[u8], file: &mut File, page_size: usize) -> Vec<Row> {
     }
 }
 
+fn row(cell: &[u8]) -> Row {
+    // assume header length is 1 byte
+    let header_length = cell[0];
+    let mut header = &cell[1..header_length as usize];
+    let mut cell = &cell[header_length as usize..];
+
+    let mut row = vec![];
+
+    while !header.is_empty() {
+        let (t, header_) = variant(header);
+        header = header_;
+
+        match t {
+            // TODO
+            // 0 => row.push(Column::Integer(row_id as i64)),
+            1 => {
+                row.push(Column::Integer(cell[0] as i64));
+                cell = &cell[1..];
+            }
+            2 => {
+                row.push(Column::Integer(
+                    i16::from_be_bytes([cell[0], cell[1]]) as i64
+                ));
+                cell = &cell[2..];
+            }
+            3 => {
+                row.push(Column::Integer(i32::from_be_bytes([
+                    if cell[0] & 0x80 != 0 { 0xff } else { 0 },
+                    cell[0],
+                    cell[1],
+                    cell[2],
+                ]) as i64));
+                cell = &cell[3..];
+            }
+            9 => {
+                row.push(Column::Integer(1));
+            }
+            t if t >= 13 && t % 2 == 1 => {
+                let length = ((t - 13) / 2) as usize;
+                let text = std::str::from_utf8(&cell[..length]).unwrap();
+                row.push(Column::Text(text.to_string()));
+                cell = &cell[length..];
+            }
+            _ => unimplemented!("type {}", t),
+        }
+    }
+
+    row
+}
+
+fn index(file: &mut File, page: &[u8], page_size: usize, key: &str) -> Vec<Row> {
+    match page[0] {
+        0x02 => {
+            // internal page
+            let _right_most_pointer = u32::from_be_bytes([page[8], page[9], page[10], page[11]]);
+            let number_of_cells = u16::from_be_bytes([page[3], page[4]]);
+
+            let cell_indices = (0..number_of_cells as usize)
+                .map(|i| u16::from_be_bytes([page[12 + 2 * i], page[12 + 2 * i + 1]]))
+                .collect::<Vec<_>>();
+
+            let mut left_key = None;
+            let mut result = vec![];
+
+            for i in cell_indices {
+                let cell = &page[i as usize..];
+                let next_page = u32::from_be_bytes([cell[0], cell[1], cell[2], cell[3]]);
+                let cell = &cell[4..];
+                let (_payload_length, cell) = variant(cell);
+
+                // assume header length is 1 byte
+                let header_length = cell[0];
+                let header = &cell[1..header_length as usize];
+                let cell = &cell[header_length as usize..];
+                let (t, _) = variant(header);
+                assert!(t >= 13 && t % 2 == 1);
+                let length = ((t - 13) / 2) as usize;
+                let text = std::str::from_utf8(&cell[..length]).unwrap();
+
+                match left_key {
+                    None => {
+                        if key <= text {
+                            let mut page = vec![0; page_size];
+                            file.seek(SeekFrom::Start((next_page as u64 - 1) * page_size as u64))
+                                .unwrap();
+                            file.read_exact(&mut page).unwrap();
+
+                            result.extend(index(file, &page, page_size, key));
+                        }
+                        left_key = Some(text);
+                    }
+                    Some(lk) => {
+                        if lk <= key && key <= text {
+                            let mut page = vec![0; page_size];
+                            file.seek(SeekFrom::Start((next_page as u64 - 1) * page_size as u64))
+                                .unwrap();
+                            file.read_exact(&mut page).unwrap();
+
+                            result.extend(index(file, &page, page_size, key));
+                        }
+
+                        left_key = Some(text);
+                    }
+                }
+            }
+            /*
+            let mut page = vec![0; page_size];
+            file.seek(SeekFrom::Start(
+                (right_most_pointer as u64 - 1) * page_size as u64,
+            ))
+            .unwrap();
+            file.read_exact(&mut page).unwrap();
+            result.extend(index(file, &page, page_size, key));
+            */
+
+            result
+        }
+        0x0a => {
+            let number_of_cells = u16::from_be_bytes([page[3], page[4]]);
+
+            let cell_indices = (0..number_of_cells as usize)
+                .map(|i| u16::from_be_bytes([page[8 + 2 * i], page[8 + 2 * i + 1]]))
+                .collect::<Vec<_>>();
+
+            let mut result = vec![];
+
+            for i in cell_indices {
+                let cell = &page[i as usize..];
+                let (_payload_length, cell) = variant(cell);
+
+                let row = row(cell);
+                dbg!(&row);
+                if row[0].to_string() == key {
+                    result.push(row);
+                }
+            }
+
+            result
+        }
+        _ => unreachable!(),
+    }
+}
+
 fn sql_column_names(sql: &str) -> Vec<String> {
     let inner_bracket: String = sql
         .chars()
@@ -295,7 +438,7 @@ fn main() -> Result<()> {
 
         let tables = tables(&first_page);
 
-        let table = tables.into_iter().find(|t| t.name == table_name).unwrap();
+        let table = tables.iter().find(|t| t.name == table_name).unwrap();
 
         let sql_coumn_names = sql_column_names(table.sql.as_str());
 
@@ -329,6 +472,43 @@ fn main() -> Result<()> {
         } else {
             Vec::new()
         };
+
+        let applicable_index = if let Some((column_index, value)) = equals.first() {
+            tables
+                .iter()
+                .filter(|t| t.ty == "index" && t.tbl_name == table_name)
+                .find(|t| {
+                    let column = RegexBuilder::new(r"CREATE INDEX \w+\s+ON (\w+) \((.+)\)")
+                        .case_insensitive(true)
+                        .build()
+                        .unwrap()
+                        .captures(t.sql.as_str())
+                        .unwrap()
+                        .get(2)
+                        .unwrap()
+                        .as_str();
+
+                    sql_coumn_names[*column_index] == column
+                })
+                .map(|t| t.rootpage)
+        } else {
+            None
+        };
+
+        if let Some(index_page) = applicable_index {
+            let mut page = vec![0; page_size as usize];
+            file.seek(SeekFrom::Start((index_page as u64 - 1) * page_size as u64))
+                .unwrap();
+            file.read_exact(&mut page).unwrap();
+
+            dbg!(index(
+                &mut file,
+                &page,
+                page_size as usize,
+                equals.first().unwrap().1
+            ));
+            return Ok(());
+        }
 
         let rows = rows(&page, &mut file, page_size as usize)
             .into_iter()
